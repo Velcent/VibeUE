@@ -2063,6 +2063,45 @@ public:
 	);
 
 	/**
+	 * Convenience: call a function off of a Blueprint variable in one shot.
+	 *
+	 * Resolves the variable's type to its owner class, creates a Get node for the
+	 * variable and a function-call node for the function, and wires the variable's
+	 * output pin into the call's "self" pin. Use this when you would otherwise
+	 * compose add_get_variable_node + add_function_call_node + connect_nodes.
+	 *
+	 * The variable must be an object-reference type (UObject subclass). For
+	 * inherited variables the owner class is read from the GeneratedClass property,
+	 * so this works for variables defined on parent classes too.
+	 *
+	 * @param BlueprintPath - Full path to the blueprint that contains the graph
+	 * @param GraphName     - Name of the graph (e.g. "EventGraph")
+	 * @param VariableName  - Variable on this blueprint whose type owns the function
+	 * @param FunctionName  - Function to call on the variable's class (e.g. "GetRandomPatrolPoint")
+	 * @param PosX          - X position for the function-call node
+	 * @param PosY          - Y position for the function-call node
+	 * @return Node ID (GUID) of the function-call node if successful, empty string otherwise
+	 *
+	 * Example:
+	 *   # PatrolPointManager is a BP_PatrolPointManager_C variable on STT_MoveToPatrolPoint
+	 *   call_id = unreal.BlueprintService.add_function_call_on_variable(
+	 *       "/Game/StateTree/Tasks/STT_MoveToPatrolPoint",
+	 *       "EventGraph",
+	 *       "PatrolPointManager",
+	 *       "GetRandomPatrolPoint",
+	 *       400, 100)
+	 */
+	UFUNCTION(BlueprintCallable, Category = "VibeUE|Blueprints")
+	static FString AddFunctionCallOnVariable(
+		const FString& BlueprintPath,
+		const FString& GraphName,
+		const FString& VariableName,
+		const FString& FunctionName,
+		float PosX = 0.0f,
+		float PosY = 0.0f
+	);
+
+	/**
 	 * Add a delegate bind node (AddDelegate) to a graph.
 	 * This creates the "Bind Event to <DelegateName>" node used to subscribe a function to a multicast delegate.
 	 *

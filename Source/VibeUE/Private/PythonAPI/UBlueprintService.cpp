@@ -143,6 +143,65 @@ namespace
 			}
 		}
 
+		// Blueprint asset path forms: "/Game/Path/BP_Foo", "/Game/Path/BP_Foo.BP_Foo",
+		// or "/Game/Path/BP_Foo.BP_Foo_C". FindObject/FindFirstObject only see classes
+		// already loaded into memory — for an unloaded Blueprint we have to actually
+		// load the asset to materialize its GeneratedClass.
+		if (ClassName.StartsWith(TEXT("/")))
+		{
+			FString PackagePath = ClassName;
+			int32 DotIdx;
+			if (PackagePath.FindChar(TEXT('.'), DotIdx))
+			{
+				PackagePath.LeftInline(DotIdx);
+			}
+			if (UObject* Loaded = UEditorAssetLibrary::LoadAsset(PackagePath))
+			{
+				if (UBlueprint* BP = Cast<UBlueprint>(Loaded))
+				{
+					if (BP->GeneratedClass)
+					{
+						return BP->GeneratedClass;
+					}
+				}
+				if (UClass* DirectClass = Cast<UClass>(Loaded))
+				{
+					return DirectClass;
+				}
+			}
+		}
+
+		// Asset registry lookup by short Blueprint name. Handles "BP_PatrolPointManager_C"
+		// and "BP_PatrolPointManager" when the Blueprint isn't loaded yet.
+		{
+			FString ShortName = ClassName;
+			if (ShortName.EndsWith(TEXT("_C"), ESearchCase::CaseSensitive))
+			{
+				ShortName.LeftChopInline(2);
+			}
+
+			if (!ShortName.IsEmpty() && !ShortName.Contains(TEXT("/")))
+			{
+				IAssetRegistry& Registry = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry")).Get();
+				TArray<FAssetData> Assets;
+				Registry.GetAssetsByClass(UBlueprint::StaticClass()->GetClassPathName(), Assets);
+				for (const FAssetData& Asset : Assets)
+				{
+					if (Asset.AssetName == FName(*ShortName))
+					{
+						if (UBlueprint* BP = Cast<UBlueprint>(Asset.GetAsset()))
+						{
+							if (BP->GeneratedClass)
+							{
+								return BP->GeneratedClass;
+							}
+						}
+						break;
+					}
+				}
+			}
+		}
+
 		return nullptr;
 	}
 
@@ -3985,6 +4044,155 @@ FString UBlueprintService::AddFunctionCallNode(
 
 	FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
 	UE_LOG(LogTemp, Log, TEXT("AddFunctionCallNode: Added %s::%s to %s"), *FunctionOwnerClass, *FunctionName, *GraphName);
+
+	return CallNode->NodeGuid.ToString();
+}
+
+FString UBlueprintService::AddFunctionCallOnVariable(
+	const FString& BlueprintPath,
+	const FString& GraphName,
+	const FString& VariableName,
+	const FString& FunctionName,
+	float PosX,
+	float PosY)
+{
+	UBlueprint* Blueprint = LoadBlueprint(BlueprintPath);
+	if (!Blueprint)
+	{
+		UE_LOG(LogTemp, Error, TEXT("AddFunctionCallOnVariable: Failed to load blueprint: %s"), *BlueprintPath);
+		return FString();
+	}
+
+	UEdGraph* Graph = FindGraph(Blueprint, GraphName);
+	if (!Graph)
+	{
+		UE_LOG(LogTemp, Error, TEXT("AddFunctionCallOnVariable: Graph '%s' not found in %s"), *GraphName, *BlueprintPath);
+		return FString();
+	}
+
+	if (!Blueprint->GeneratedClass)
+	{
+		UE_LOG(LogTemp, Error, TEXT("AddFunctionCallOnVariable: Blueprint '%s' has no GeneratedClass — compile it first"), *BlueprintPath);
+		return FString();
+	}
+
+	// Resolve the variable's owner class via its property on the GeneratedClass.
+	// This handles inherited variables and avoids parsing FBPVariableDescription.VarType.
+	FProperty* VarProperty = Blueprint->GeneratedClass->FindPropertyByName(FName(*VariableName));
+	if (!VarProperty)
+	{
+		UE_LOG(LogTemp, Error, TEXT("AddFunctionCallOnVariable: Variable '%s' not found on %s"), *VariableName, *BlueprintPath);
+		return FString();
+	}
+
+	UClass* OwnerClass = nullptr;
+	if (FObjectProperty* ObjProp = CastField<FObjectProperty>(VarProperty))
+	{
+		OwnerClass = ObjProp->PropertyClass;
+	}
+	else if (FClassProperty* ClassProp = CastField<FClassProperty>(VarProperty))
+	{
+		OwnerClass = ClassProp->MetaClass;
+	}
+
+	if (!OwnerClass)
+	{
+		UE_LOG(LogTemp, Error, TEXT("AddFunctionCallOnVariable: Variable '%s' is not an object reference — cannot call a function on it"), *VariableName);
+		return FString();
+	}
+
+	// Find the function on the variable's class (or any parent).
+	UFunction* Function = OwnerClass->FindFunctionByName(FName(*FunctionName));
+	UEdGraphNode* SpawnedCallNode = nullptr;
+	if (!Function)
+	{
+		if (UBlueprintFunctionNodeSpawner* Spawner = FindBestFunctionSpawner(Blueprint, Graph, OwnerClass, FunctionName))
+		{
+			SpawnedCallNode = Spawner->Invoke(Graph, IBlueprintNodeBinder::FBindingSet(), FVector2D(PosX, PosY));
+			if (!SpawnedCallNode)
+			{
+				UE_LOG(LogTemp, Error, TEXT("AddFunctionCallOnVariable: Spawner fallback matched '%s' on '%s' but failed to invoke"), *FunctionName, *OwnerClass->GetName());
+				return FString();
+			}
+			if (const UFunction* Resolved = Spawner->GetFunction())
+			{
+				Function = const_cast<UFunction*>(Resolved);
+			}
+		}
+		else
+		{
+			UE_LOG(LogTemp, Error, TEXT("AddFunctionCallOnVariable: Function '%s' not found on '%s'"), *FunctionName, *OwnerClass->GetName());
+			return FString();
+		}
+	}
+
+	// Build the function call node (unless the spawner already produced one).
+	UK2Node_CallFunction* CallNode = Cast<UK2Node_CallFunction>(SpawnedCallNode);
+	if (!CallNode)
+	{
+		CallNode = NewObject<UK2Node_CallFunction>(Graph);
+		CallNode->SetFromFunction(Function);
+		Graph->AddNode(CallNode, false, false);
+		CallNode->CreateNewGuid();
+		CallNode->PostPlacedNewNode();
+		CallNode->AllocateDefaultPins();
+		CallNode->NodePosX = PosX;
+		CallNode->NodePosY = PosY;
+	}
+
+	// Build a self getter for the variable (offset to the left of the call node).
+	UK2Node_VariableGet* GetterNode = NewObject<UK2Node_VariableGet>(Graph);
+	GetterNode->VariableReference.SetSelfMember(FName(*VariableName));
+	Graph->AddNode(GetterNode, false, false);
+	GetterNode->CreateNewGuid();
+	GetterNode->PostPlacedNewNode();
+	GetterNode->AllocateDefaultPins();
+	GetterNode->NodePosX = PosX - 250.0f;
+	GetterNode->NodePosY = PosY + 16.0f;
+
+	// Wire variable output -> function call's self pin.
+	UEdGraphPin* VarOutPin = nullptr;
+	for (UEdGraphPin* Pin : GetterNode->Pins)
+	{
+		if (Pin && Pin->Direction == EGPD_Output)
+		{
+			VarOutPin = Pin;
+			break;
+		}
+	}
+
+	UEdGraphPin* SelfPin = CallNode->FindPin(UEdGraphSchema_K2::PN_Self, EGPD_Input);
+	if (!SelfPin)
+	{
+		// Some K2_* compact nodes use the function's first parameter as the self/target pin
+		// under a different display name. Fall back to the first input object pin.
+		for (UEdGraphPin* Pin : CallNode->Pins)
+		{
+			if (Pin && Pin->Direction == EGPD_Input && Pin->PinType.PinCategory == UEdGraphSchema_K2::PC_Object)
+			{
+				SelfPin = Pin;
+				break;
+			}
+		}
+	}
+
+	if (VarOutPin && SelfPin)
+	{
+		const UEdGraphSchema* Schema = Graph->GetSchema();
+		Schema->TryCreateConnection(VarOutPin, SelfPin);
+	}
+	else
+	{
+		UE_LOG(LogTemp, Warning, TEXT("AddFunctionCallOnVariable: Created nodes but could not auto-wire self pin for '%s::%s' (var pin: %s, self pin: %s)"),
+			*OwnerClass->GetName(), *FunctionName,
+			VarOutPin ? TEXT("ok") : TEXT("missing"),
+			SelfPin ? TEXT("ok") : TEXT("missing"));
+	}
+
+	FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
+	UE_LOG(LogTemp, Log, TEXT("AddFunctionCallOnVariable: %s.%s() in %s — call=%s, getter=%s"),
+		*VariableName, *FunctionName, *GraphName,
+		*CallNode->NodeGuid.ToString(), *GetterNode->NodeGuid.ToString());
 
 	return CallNode->NodeGuid.ToString();
 }
