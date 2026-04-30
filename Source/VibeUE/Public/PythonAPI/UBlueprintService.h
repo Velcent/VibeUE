@@ -1876,6 +1876,39 @@ public:
 	);
 
 	/**
+	 * Get the nodes currently selected by the user in an open Blueprint editor.
+	 *
+	 * Reads the live selection from FBlueprintEditor::GetSelectedNodes(). The
+	 * Blueprint must already be open in the editor (graph selection only exists
+	 * on the open Slate panel — there is no persisted selection state on the
+	 * asset itself). Use this to act on whatever the user has highlighted in
+	 * the graph (e.g. inspect, reposition, document, or programmatically edit
+	 * the selected nodes).
+	 *
+	 * @param BlueprintPath - Full path to the blueprint. If empty, the first
+	 *                        open Blueprint editor with a non-empty selection
+	 *                        is used (handy when the agent doesn't yet know
+	 *                        which asset the user is looking at).
+	 * @return Array of node information for the currently selected graph nodes.
+	 *         The array is empty if no Blueprint editor is open, the asset isn't
+	 *         open, or nothing is selected. The graph the selection belongs to
+	 *         can be inferred from the focused graph; callers that need the
+	 *         graph name explicitly should pair this with get_nodes_in_graph.
+	 *
+	 * Example:
+	 *   selected = unreal.BlueprintService.get_selected_nodes("/Game/BP_Player")
+	 *   for n in selected:
+	 *       print(f"selected: {n.node_title} ({n.node_type}) @ ({n.pos_x},{n.pos_y})")
+	 *
+	 * Example - discover what the user is looking at right now:
+	 *   selected = unreal.BlueprintService.get_selected_nodes("")
+	 */
+	UFUNCTION(BlueprintCallable, Category = "VibeUE|Blueprints")
+	static TArray<FBlueprintNodeInfo> GetSelectedNodes(
+		const FString& BlueprintPath = TEXT("")
+	);
+
+	/**
 	 * Add a cast node to a graph.
 	 *
 	 * @param BlueprintPath - Full path to the blueprint

@@ -3857,6 +3857,151 @@ TArray<FBlueprintNodeInfo> UBlueprintService::GetNodesInGraph(
 	return NodeInfos;
 }
 
+namespace
+{
+	// Helper: convert a UEdGraphNode into the FBlueprintNodeInfo struct used by
+	// GetNodesInGraph / GetSelectedNodes. Mirrors the body of the GetNodesInGraph
+	// loop so both APIs produce identical shapes.
+	static FBlueprintNodeInfo MakeBlueprintNodeInfoFromNode(UEdGraphNode* Node)
+	{
+		FBlueprintNodeInfo NodeInfo;
+		if (!Node)
+		{
+			return NodeInfo;
+		}
+
+		NodeInfo.NodeId = Node->NodeGuid.ToString();
+		NodeInfo.NodeType = Node->GetClass()->GetName();
+		NodeInfo.NodeTitle = Node->GetNodeTitle(ENodeTitleType::FullTitle).ToString();
+		NodeInfo.PosX = Node->NodePosX;
+		NodeInfo.PosY = Node->NodePosY;
+
+		for (UEdGraphPin* Pin : Node->Pins)
+		{
+			if (!Pin)
+			{
+				continue;
+			}
+
+			NodeInfo.PinNames.Add(Pin->PinName.ToString());
+
+			FBlueprintPinInfo PinInfo;
+			PinInfo.PinName = Pin->PinName.ToString();
+			PinInfo.PinType = Pin->PinType.PinCategory.ToString();
+			PinInfo.bIsInput = (Pin->Direction == EGPD_Input);
+			PinInfo.bIsConnected = Pin->LinkedTo.Num() > 0;
+			PinInfo.DefaultValue = Pin->DefaultValue;
+			NodeInfo.Pins.Add(PinInfo);
+		}
+
+		return NodeInfo;
+	}
+}
+
+TArray<FBlueprintNodeInfo> UBlueprintService::GetSelectedNodes(const FString& BlueprintPath)
+{
+	TArray<FBlueprintNodeInfo> NodeInfos;
+
+	UAssetEditorSubsystem* AssetEditorSubsystem = GEditor ? GEditor->GetEditorSubsystem<UAssetEditorSubsystem>() : nullptr;
+	if (!AssetEditorSubsystem)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("GetSelectedNodes: AssetEditorSubsystem not available"));
+		return NodeInfos;
+	}
+
+	// Helper lambda: gather the selected graph nodes from one Blueprint editor.
+	auto CollectFromEditor = [&NodeInfos](FBlueprintEditor* BlueprintEditor) -> bool
+	{
+		if (!BlueprintEditor)
+		{
+			return false;
+		}
+
+		const FGraphPanelSelectionSet Selection = BlueprintEditor->GetSelectedNodes();
+		if (Selection.Num() == 0)
+		{
+			return false;
+		}
+
+		for (UObject* SelectedObject : Selection)
+		{
+			if (UEdGraphNode* GraphNode = Cast<UEdGraphNode>(SelectedObject))
+			{
+				NodeInfos.Add(MakeBlueprintNodeInfoFromNode(GraphNode));
+			}
+		}
+		return NodeInfos.Num() > 0;
+	};
+
+	if (!BlueprintPath.IsEmpty())
+	{
+		// Caller specified the Blueprint — only inspect that one editor.
+		UBlueprint* Blueprint = LoadBlueprint(BlueprintPath);
+		if (!Blueprint)
+		{
+			UE_LOG(LogTemp, Warning, TEXT("GetSelectedNodes: Failed to load blueprint: %s"), *BlueprintPath);
+			return NodeInfos;
+		}
+
+		IAssetEditorInstance* EditorInstance = AssetEditorSubsystem->FindEditorForAsset(Blueprint, /*bFocusIfOpen=*/false);
+		if (!EditorInstance)
+		{
+			UE_LOG(LogTemp, Warning, TEXT("GetSelectedNodes: Blueprint '%s' is not open in the editor (selection state only exists for open assets)"), *BlueprintPath);
+			return NodeInfos;
+		}
+
+		// Blueprint editors all derive from FBlueprintEditor (incl. WidgetBlueprintEditor, AnimBlueprintEditor, etc.).
+		// We rely on the editor name guard to avoid an unsafe static_cast on unrelated editor types.
+		if (EditorInstance->GetEditorName() != FName(TEXT("BlueprintEditor"))
+			&& EditorInstance->GetEditorName() != FName(TEXT("WidgetBlueprintEditor"))
+			&& EditorInstance->GetEditorName() != FName(TEXT("AnimationBlueprintEditor")))
+		{
+			UE_LOG(LogTemp, Warning, TEXT("GetSelectedNodes: Editor for '%s' is not a Blueprint editor (got '%s')"),
+				*BlueprintPath, *EditorInstance->GetEditorName().ToString());
+			return NodeInfos;
+		}
+
+		FBlueprintEditor* BlueprintEditor = static_cast<FBlueprintEditor*>(EditorInstance);
+		CollectFromEditor(BlueprintEditor);
+		return NodeInfos;
+	}
+
+	// No Blueprint specified — scan all open editors and return the first
+	// Blueprint editor that has a non-empty graph selection.
+	const TArray<UObject*> OpenAssets = AssetEditorSubsystem->GetAllEditedAssets();
+	for (UObject* Asset : OpenAssets)
+	{
+		UBlueprint* Blueprint = Cast<UBlueprint>(Asset);
+		if (!Blueprint)
+		{
+			continue;
+		}
+
+		IAssetEditorInstance* EditorInstance = AssetEditorSubsystem->FindEditorForAsset(Blueprint, /*bFocusIfOpen=*/false);
+		if (!EditorInstance)
+		{
+			continue;
+		}
+
+		if (EditorInstance->GetEditorName() != FName(TEXT("BlueprintEditor"))
+			&& EditorInstance->GetEditorName() != FName(TEXT("WidgetBlueprintEditor"))
+			&& EditorInstance->GetEditorName() != FName(TEXT("AnimationBlueprintEditor")))
+		{
+			continue;
+		}
+
+		FBlueprintEditor* BlueprintEditor = static_cast<FBlueprintEditor*>(EditorInstance);
+		if (CollectFromEditor(BlueprintEditor))
+		{
+			UE_LOG(LogTemp, Verbose, TEXT("GetSelectedNodes: Returning selection from blueprint '%s'"),
+				*Blueprint->GetPathName());
+			return NodeInfos;
+		}
+	}
+
+	return NodeInfos;
+}
+
 FBlueprintCompileResult UBlueprintService::CompileBlueprint(const FString& BlueprintPath)
 {
 	FBlueprintCompileResult Result;

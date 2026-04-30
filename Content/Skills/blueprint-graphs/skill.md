@@ -88,6 +88,27 @@ for m in matches:
 
 Also: search `discover_nodes` by **function name**, not variable type. To find the Broadcast Delegate node for a `StateTreeDelegate` variable, search `"Broadcast"` — NOT `"Dispatcher"` or `"StateTreeDelegate"`.
 
+### 👀 Reading the User's Live Graph Selection — `get_selected_nodes()`
+
+`get_nodes_in_graph()` returns **every** node in a graph. To act on just the nodes the user has highlighted in the open Blueprint editor, use `get_selected_nodes()` instead. Returned objects are the same `FBlueprintNodeInfo` shape as `get_nodes_in_graph()` — same `node_id`, `node_title`, `node_type`, `pos_x`, `pos_y`, `pin_names`, and `pins` fields — so you can pass `node.node_id` straight into `get_node_pins()`, `set_node_position()`, `delete_node()`, etc.
+
+**The Blueprint MUST already be open in the editor.** Selection state lives on the Slate panel, not on the asset; closing the editor discards it. Calling `get_selected_nodes()` for a closed asset returns an empty array (and logs a warning).
+
+```python
+# Caller knows the asset
+selected = unreal.BlueprintService.get_selected_nodes("/Game/BP_Player")
+
+# Caller does NOT know which asset the user is looking at — empty path
+# returns the selection from the first open Blueprint editor that has one.
+selected = unreal.BlueprintService.get_selected_nodes("")
+
+for n in selected:
+    print(f"selected: {n.node_title} ({n.node_type}) @ ({n.pos_x}, {n.pos_y})")
+    pins = unreal.BlueprintService.get_node_pins("/Game/BP_Player", "EventGraph", n.node_id)
+```
+
+Use this when the user says "this node", "the selected node(s)", "what I have highlighted", or "the one I'm looking at". An empty result means *nothing is selected in any open Blueprint editor* — ask the user to click a node in the graph rather than guessing.
+
 ### ⚠️ Branch Node Pin Names
 
 Use **`then`** and **`else`**, NOT `true`/`false`:
