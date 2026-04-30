@@ -29,6 +29,7 @@
 #include "K2Node_AddDelegate.h"          // For delegate bind nodes (add_delegate_bind_node)
 #include "K2Node_CreateDelegate.h"       // For create event nodes (add_create_delegate_node)
 #include "K2Node_MakeStruct.h"           // For STRUCT key: creating typed struct Make nodes
+#include "EdGraphNode_Comment.h"         // For UEdGraphNode_Comment (comment box nodes)
 #include "InputAction.h"                 // For UInputAction
 #include "Kismet/KismetSystemLibrary.h"
 #include "Kismet/KismetMathLibrary.h"
@@ -3680,6 +3681,186 @@ FString UBlueprintService::AddPrintStringNode(
 	return PrintNode->NodeGuid.ToString();
 }
 
+namespace
+{
+	// Estimate a node's size for bounding-box math when NodeWidth/NodeHeight haven't been
+	// computed yet (Slate widget hasn't run). The defaults are intentionally generous so
+	// the comment box doesn't visually clip the wrapped nodes.
+	static void EstimateNodeBounds(UEdGraphNode* Node, float& OutMinX, float& OutMinY, float& OutMaxX, float& OutMaxY)
+	{
+		const float DefaultWidth = 256.0f;
+		const float DefaultHeight = 128.0f;
+
+		const float W = (Node && Node->NodeWidth  > 0.0f) ? Node->NodeWidth  : DefaultWidth;
+		const float H = (Node && Node->NodeHeight > 0.0f) ? Node->NodeHeight : DefaultHeight;
+
+		OutMinX = Node ? Node->NodePosX : 0.0f;
+		OutMinY = Node ? Node->NodePosY : 0.0f;
+		OutMaxX = OutMinX + W;
+		OutMaxY = OutMinY + H;
+	}
+
+	static UEdGraphNode_Comment* SpawnCommentNode(
+		UEdGraph* Graph,
+		const FString& CommentText,
+		float PosX, float PosY,
+		float Width, float Height,
+		float R, float G, float B, float A)
+	{
+		if (!Graph)
+		{
+			return nullptr;
+		}
+
+		UEdGraphNode_Comment* CommentNode = NewObject<UEdGraphNode_Comment>(Graph);
+		Graph->AddNode(CommentNode, /*bFromUI=*/false, /*bSelectNewNode=*/false);
+		CommentNode->CreateNewGuid();
+		CommentNode->PostPlacedNewNode();
+		CommentNode->AllocateDefaultPins();
+
+		CommentNode->NodePosX  = PosX;
+		CommentNode->NodePosY  = PosY;
+		CommentNode->NodeWidth  = FMath::Max(64.0f, Width);
+		CommentNode->NodeHeight = FMath::Max(64.0f, Height);
+		CommentNode->NodeComment = CommentText;
+		CommentNode->CommentColor = FLinearColor(R, G, B, A);
+
+		return CommentNode;
+	}
+}
+
+FString UBlueprintService::AddCommentNode(
+	const FString& BlueprintPath,
+	const FString& GraphName,
+	const FString& CommentText,
+	float PosX,
+	float PosY,
+	float Width,
+	float Height,
+	float R, float G, float B, float A)
+{
+	UBlueprint* Blueprint = LoadBlueprint(BlueprintPath);
+	if (!Blueprint)
+	{
+		UE_LOG(LogTemp, Error, TEXT("AddCommentNode: Failed to load blueprint: %s"), *BlueprintPath);
+		return FString();
+	}
+
+	UEdGraph* Graph = ResolveBlueprintGraph(Blueprint, GraphName);
+	if (!Graph)
+	{
+		UE_LOG(LogTemp, Error, TEXT("AddCommentNode: Graph '%s' not found in %s"), *GraphName, *BlueprintPath);
+		return FString();
+	}
+
+	const FScopedTransaction Transaction(NSLOCTEXT("VibeUE", "AddCommentNode", "Add Comment Node"));
+	Graph->Modify();
+
+	UEdGraphNode_Comment* CommentNode = SpawnCommentNode(Graph, CommentText, PosX, PosY, Width, Height, R, G, B, A);
+	if (!CommentNode)
+	{
+		UE_LOG(LogTemp, Error, TEXT("AddCommentNode: Failed to spawn comment node in graph '%s'"), *GraphName);
+		return FString();
+	}
+
+	FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
+	UE_LOG(LogTemp, Log, TEXT("AddCommentNode: Added comment '%s' in %s at (%.0f, %.0f) size (%.0f x %.0f)"),
+		*CommentText, *GraphName, PosX, PosY, Width, Height);
+
+	return CommentNode->NodeGuid.ToString();
+}
+
+FString UBlueprintService::AddCommentAroundNodes(
+	const FString& BlueprintPath,
+	const FString& GraphName,
+	const FString& CommentText,
+	const TArray<FString>& NodeIds,
+	float Padding,
+	float R, float G, float B, float A)
+{
+	UBlueprint* Blueprint = LoadBlueprint(BlueprintPath);
+	if (!Blueprint)
+	{
+		UE_LOG(LogTemp, Error, TEXT("AddCommentAroundNodes: Failed to load blueprint: %s"), *BlueprintPath);
+		return FString();
+	}
+
+	UEdGraph* Graph = ResolveBlueprintGraph(Blueprint, GraphName);
+	if (!Graph)
+	{
+		UE_LOG(LogTemp, Error, TEXT("AddCommentAroundNodes: Graph '%s' not found in %s"), *GraphName, *BlueprintPath);
+		return FString();
+	}
+
+	if (NodeIds.Num() == 0)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("AddCommentAroundNodes: No node IDs provided"));
+		return FString();
+	}
+
+	// Resolve node IDs to actual nodes, ignoring (and warning about) unknown IDs.
+	TArray<UEdGraphNode*> Nodes;
+	Nodes.Reserve(NodeIds.Num());
+	for (const FString& Id : NodeIds)
+	{
+		if (UEdGraphNode* Node = FindNodeById(Graph, Id))
+		{
+			Nodes.Add(Node);
+		}
+		else
+		{
+			UE_LOG(LogTemp, Warning, TEXT("AddCommentAroundNodes: Node id '%s' not found in graph '%s' (skipped)"),
+				*Id, *GraphName);
+		}
+	}
+
+	if (Nodes.Num() == 0)
+	{
+		UE_LOG(LogTemp, Error, TEXT("AddCommentAroundNodes: None of the supplied node IDs were found in graph '%s'"), *GraphName);
+		return FString();
+	}
+
+	// Compute the bounding box.
+	float MinX = TNumericLimits<float>::Max();
+	float MinY = TNumericLimits<float>::Max();
+	float MaxX = TNumericLimits<float>::Lowest();
+	float MaxY = TNumericLimits<float>::Lowest();
+
+	for (UEdGraphNode* Node : Nodes)
+	{
+		float nMinX, nMinY, nMaxX, nMaxY;
+		EstimateNodeBounds(Node, nMinX, nMinY, nMaxX, nMaxY);
+		MinX = FMath::Min(MinX, nMinX);
+		MinY = FMath::Min(MinY, nMinY);
+		MaxX = FMath::Max(MaxX, nMaxX);
+		MaxY = FMath::Max(MaxY, nMaxY);
+	}
+
+	// Apply padding. The top edge needs a bit of extra room so the comment title bar
+	// doesn't overlap the wrapped nodes (~32px is the title bar in the editor).
+	const float TitleBar = 32.0f;
+	const float CommentX = MinX - Padding;
+	const float CommentY = MinY - Padding - TitleBar;
+	const float CommentW = (MaxX - MinX) + (Padding * 2.0f);
+	const float CommentH = (MaxY - MinY) + (Padding * 2.0f) + TitleBar;
+
+	const FScopedTransaction Transaction(NSLOCTEXT("VibeUE", "AddCommentAroundNodes", "Add Comment Around Nodes"));
+	Graph->Modify();
+
+	UEdGraphNode_Comment* CommentNode = SpawnCommentNode(Graph, CommentText, CommentX, CommentY, CommentW, CommentH, R, G, B, A);
+	if (!CommentNode)
+	{
+		UE_LOG(LogTemp, Error, TEXT("AddCommentAroundNodes: Failed to spawn comment node in graph '%s'"), *GraphName);
+		return FString();
+	}
+
+	FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
+	UE_LOG(LogTemp, Log, TEXT("AddCommentAroundNodes: Wrapped %d node(s) in graph '%s' with comment '%s'"),
+		Nodes.Num(), *GraphName, *CommentText);
+
+	return CommentNode->NodeGuid.ToString();
+}
+
 bool UBlueprintService::ConnectNodes(
 	const FString& BlueprintPath,
 	const FString& GraphName,
@@ -3852,6 +4033,151 @@ TArray<FBlueprintNodeInfo> UBlueprintService::GetNodesInGraph(
 		}
 
 		NodeInfos.Add(NodeInfo);
+	}
+
+	return NodeInfos;
+}
+
+namespace
+{
+	// Helper: convert a UEdGraphNode into the FBlueprintNodeInfo struct used by
+	// GetNodesInGraph / GetSelectedNodes. Mirrors the body of the GetNodesInGraph
+	// loop so both APIs produce identical shapes.
+	static FBlueprintNodeInfo MakeBlueprintNodeInfoFromNode(UEdGraphNode* Node)
+	{
+		FBlueprintNodeInfo NodeInfo;
+		if (!Node)
+		{
+			return NodeInfo;
+		}
+
+		NodeInfo.NodeId = Node->NodeGuid.ToString();
+		NodeInfo.NodeType = Node->GetClass()->GetName();
+		NodeInfo.NodeTitle = Node->GetNodeTitle(ENodeTitleType::FullTitle).ToString();
+		NodeInfo.PosX = Node->NodePosX;
+		NodeInfo.PosY = Node->NodePosY;
+
+		for (UEdGraphPin* Pin : Node->Pins)
+		{
+			if (!Pin)
+			{
+				continue;
+			}
+
+			NodeInfo.PinNames.Add(Pin->PinName.ToString());
+
+			FBlueprintPinInfo PinInfo;
+			PinInfo.PinName = Pin->PinName.ToString();
+			PinInfo.PinType = Pin->PinType.PinCategory.ToString();
+			PinInfo.bIsInput = (Pin->Direction == EGPD_Input);
+			PinInfo.bIsConnected = Pin->LinkedTo.Num() > 0;
+			PinInfo.DefaultValue = Pin->DefaultValue;
+			NodeInfo.Pins.Add(PinInfo);
+		}
+
+		return NodeInfo;
+	}
+}
+
+TArray<FBlueprintNodeInfo> UBlueprintService::GetSelectedNodes(const FString& BlueprintPath)
+{
+	TArray<FBlueprintNodeInfo> NodeInfos;
+
+	UAssetEditorSubsystem* AssetEditorSubsystem = GEditor ? GEditor->GetEditorSubsystem<UAssetEditorSubsystem>() : nullptr;
+	if (!AssetEditorSubsystem)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("GetSelectedNodes: AssetEditorSubsystem not available"));
+		return NodeInfos;
+	}
+
+	// Helper lambda: gather the selected graph nodes from one Blueprint editor.
+	auto CollectFromEditor = [&NodeInfos](FBlueprintEditor* BlueprintEditor) -> bool
+	{
+		if (!BlueprintEditor)
+		{
+			return false;
+		}
+
+		const FGraphPanelSelectionSet Selection = BlueprintEditor->GetSelectedNodes();
+		if (Selection.Num() == 0)
+		{
+			return false;
+		}
+
+		for (UObject* SelectedObject : Selection)
+		{
+			if (UEdGraphNode* GraphNode = Cast<UEdGraphNode>(SelectedObject))
+			{
+				NodeInfos.Add(MakeBlueprintNodeInfoFromNode(GraphNode));
+			}
+		}
+		return NodeInfos.Num() > 0;
+	};
+
+	if (!BlueprintPath.IsEmpty())
+	{
+		// Caller specified the Blueprint — only inspect that one editor.
+		UBlueprint* Blueprint = LoadBlueprint(BlueprintPath);
+		if (!Blueprint)
+		{
+			UE_LOG(LogTemp, Warning, TEXT("GetSelectedNodes: Failed to load blueprint: %s"), *BlueprintPath);
+			return NodeInfos;
+		}
+
+		IAssetEditorInstance* EditorInstance = AssetEditorSubsystem->FindEditorForAsset(Blueprint, /*bFocusIfOpen=*/false);
+		if (!EditorInstance)
+		{
+			UE_LOG(LogTemp, Warning, TEXT("GetSelectedNodes: Blueprint '%s' is not open in the editor (selection state only exists for open assets)"), *BlueprintPath);
+			return NodeInfos;
+		}
+
+		// Blueprint editors all derive from FBlueprintEditor (incl. WidgetBlueprintEditor, AnimBlueprintEditor, etc.).
+		// We rely on the editor name guard to avoid an unsafe static_cast on unrelated editor types.
+		if (EditorInstance->GetEditorName() != FName(TEXT("BlueprintEditor"))
+			&& EditorInstance->GetEditorName() != FName(TEXT("WidgetBlueprintEditor"))
+			&& EditorInstance->GetEditorName() != FName(TEXT("AnimationBlueprintEditor")))
+		{
+			UE_LOG(LogTemp, Warning, TEXT("GetSelectedNodes: Editor for '%s' is not a Blueprint editor (got '%s')"),
+				*BlueprintPath, *EditorInstance->GetEditorName().ToString());
+			return NodeInfos;
+		}
+
+		FBlueprintEditor* BlueprintEditor = static_cast<FBlueprintEditor*>(EditorInstance);
+		CollectFromEditor(BlueprintEditor);
+		return NodeInfos;
+	}
+
+	// No Blueprint specified — scan all open editors and return the first
+	// Blueprint editor that has a non-empty graph selection.
+	const TArray<UObject*> OpenAssets = AssetEditorSubsystem->GetAllEditedAssets();
+	for (UObject* Asset : OpenAssets)
+	{
+		UBlueprint* Blueprint = Cast<UBlueprint>(Asset);
+		if (!Blueprint)
+		{
+			continue;
+		}
+
+		IAssetEditorInstance* EditorInstance = AssetEditorSubsystem->FindEditorForAsset(Blueprint, /*bFocusIfOpen=*/false);
+		if (!EditorInstance)
+		{
+			continue;
+		}
+
+		if (EditorInstance->GetEditorName() != FName(TEXT("BlueprintEditor"))
+			&& EditorInstance->GetEditorName() != FName(TEXT("WidgetBlueprintEditor"))
+			&& EditorInstance->GetEditorName() != FName(TEXT("AnimationBlueprintEditor")))
+		{
+			continue;
+		}
+
+		FBlueprintEditor* BlueprintEditor = static_cast<FBlueprintEditor*>(EditorInstance);
+		if (CollectFromEditor(BlueprintEditor))
+		{
+			UE_LOG(LogTemp, Verbose, TEXT("GetSelectedNodes: Returning selection from blueprint '%s'"),
+				*Blueprint->GetPathName());
+			return NodeInfos;
+		}
 	}
 
 	return NodeInfos;

@@ -88,6 +88,74 @@ for m in matches:
 
 Also: search `discover_nodes` by **function name**, not variable type. To find the Broadcast Delegate node for a `StateTreeDelegate` variable, search `"Broadcast"` — NOT `"Dispatcher"` or `"StateTreeDelegate"`.
 
+### 👀 Reading the User's Live Graph Selection — `get_selected_nodes()`
+
+`get_nodes_in_graph()` returns **every** node in a graph. To act on just the nodes the user has highlighted in the open Blueprint editor, use `get_selected_nodes()` instead. Returned objects are the same `FBlueprintNodeInfo` shape as `get_nodes_in_graph()` — same `node_id`, `node_title`, `node_type`, `pos_x`, `pos_y`, `pin_names`, and `pins` fields — so you can pass `node.node_id` straight into `get_node_pins()`, `set_node_position()`, `delete_node()`, etc.
+
+**The Blueprint MUST already be open in the editor.** Selection state lives on the Slate panel, not on the asset; closing the editor discards it. Calling `get_selected_nodes()` for a closed asset returns an empty array (and logs a warning).
+
+```python
+# Caller knows the asset
+selected = unreal.BlueprintService.get_selected_nodes("/Game/BP_Player")
+
+# Caller does NOT know which asset the user is looking at — empty path
+# returns the selection from the first open Blueprint editor that has one.
+selected = unreal.BlueprintService.get_selected_nodes("")
+
+for n in selected:
+    print(f"selected: {n.node_title} ({n.node_type}) @ ({n.pos_x}, {n.pos_y})")
+    pins = unreal.BlueprintService.get_node_pins("/Game/BP_Player", "EventGraph", n.node_id)
+```
+
+Use this when the user says "this node", "the selected node(s)", "what I have highlighted", or "the one I'm looking at". An empty result means *nothing is selected in any open Blueprint editor* — ask the user to click a node in the graph rather than guessing.
+
+### 💬 Comment Boxes — `add_comment_node()` / `add_comment_around_nodes()`
+
+Comment boxes are the coloured bubbles that visually group nodes (the editor shortcut is `C` after selecting nodes). Two APIs:
+
+- **`add_comment_node(blueprint_path, graph_name, comment_text, pos_x, pos_y, width, height, r, g, b, a)`** — explicit position and size. Use when you already know exactly where you want the box.
+- **`add_comment_around_nodes(blueprint_path, graph_name, comment_text, node_ids, padding, r, g, b, a)`** — computes the bounding box of the supplied nodes (plus `padding`, default 40 px) and pads room for the title bar. This is the programmatic equivalent of select-then-press-`C`.
+
+#### ✍️ Write *informative* comment text — this is the whole point
+
+Comment boxes are documentation that lives next to the code. A future reader (human or LLM) should be able to glance at the comment and understand **what this group of nodes accomplishes and why**, without re‑reading every pin. Treat the comment text the same way you'd treat a function header comment.
+
+**Good comments** explain intent and behaviour:
+
+- `"Pick a random patrol point and cache its world location for the Move To task"`
+- `"On Damage > 0: play hit reaction, flash material, decrement Health"`
+- `"Debounce input — ignore re‑presses within 0.25s of the last fire"`
+- `"Early‑out when the owning controller is not locally controlled (server‑auth path)"`
+
+**Bad comments** restate node titles or are filler:
+
+- `"Print String"` ❌ (just the node name)
+- `"Logic"` / `"Stuff"` / `"TODO"` ❌ (says nothing)
+- `"Branch + Set Variable"` ❌ (mechanical, not intent)
+- The user's verbatim request like `"add a comment around the nodes"` ❌ — that's the *task*, not the *meaning*
+
+**Workflow**: before calling `add_comment_around_nodes`, inspect the selected nodes (titles, pin connections, variables they read/write) and synthesise a one‑line description of what the group does. If the user gave you a hint ("this is the patrol picker"), build on it; if they didn't, derive it from the nodes themselves. Use multiple lines (`\n`) when the group has a non‑trivial flow worth narrating.
+
+```python
+sel = unreal.BlueprintService.get_selected_nodes("/Game/BP_Player")
+ids = [n.node_id for n in sel]
+
+# Derive intent from the selected nodes (event, variables read/written, called
+# functions) and write a comment that documents WHY this group exists.
+comment = (
+    "Pick a random patrol point on EnterState\n"
+    "Caches the chosen point's world location into PatrolPointLocation\n"
+    "so the subsequent Move To task has a stable target."
+)
+
+unreal.BlueprintService.add_comment_around_nodes(
+    "/Game/BP_Player", "EventGraph", comment, ids)
+```
+
+Both functions return the new comment node's `node_id` (a GUID string), or `""` on failure. Colour parameters are RGBA in 0–1 range; the default is the standard pale yellow. Unknown `node_ids` passed to `add_comment_around_nodes()` are skipped with a warning — if *all* IDs are invalid, the call returns `""`.
+
+Standard editor behaviour applies: any K2 nodes whose bounds fall inside the comment box get picked up and dragged with it (GroupMovement mode).
+
 ### ⚠️ Branch Node Pin Names
 
 Use **`then`** and **`else`**, NOT `true`/`false`:

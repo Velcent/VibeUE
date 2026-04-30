@@ -25,6 +25,7 @@ Always load the relevant skill **before writing any code**. The skill contains e
 | PCG / procedural generation / scatter | `pcg` |
 | Materials | `materials` |
 | State Trees | `state-trees` |
+| Play / test / run / PIE | `pie-testing` |
 
 ```
 manage_skills(action="load", skill_name="pcg")
