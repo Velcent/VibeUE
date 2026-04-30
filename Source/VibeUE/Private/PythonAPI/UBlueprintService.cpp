@@ -5668,13 +5668,108 @@ bool UBlueprintService::SetNodePinValue(
 			return false;
 		}
 	}
-	else
+	else if (PinCategory == UEdGraphSchema_K2::PC_Wildcard)
 	{
-		// Primitive/string/enum/struct — use schema string path
+		// BUG-2 fix (issue #373): wildcard pins (e.g. K2Node_Select case pins
+		// "NewEnumerator0..N" before the enum index resolves them) cannot store a
+		// literal default value. The schema silently drops the assignment, but
+		// SetNodePinValue used to claim success. Refuse with a diagnostic so
+		// callers know to either (a) configure the parent node so the pin
+		// resolves to a concrete type, or (b) wire a typed source like
+		// MakeLiteralName / MakeLiteralByte / MakeLiteralInt into the pin.
+		UE_LOG(LogTemp, Error,
+			TEXT("SetNodePinValue: Pin '%s' on node '%s' is a wildcard pin and cannot hold a literal default value. ")
+			TEXT("Resolve the wildcard first (e.g. configure the node's enum/type, or wire a MakeLiteral* source into the pin)."),
+			*PinName, *NodeId);
+		return false;
+	}
+	else if (PinCategory == UEdGraphSchema_K2::PC_Byte)
+	{
+		// BUG-1 fix (issue #373): some byte pins store the enum case name
+		// directly as a string (e.g. K2Node_EnumLiteral's "Enum" pin), while
+		// others — like the B pin of KismetMathLibrary::EqualEqual_ByteByte
+		// when typed against an enum-source — only accept the numeric byte
+		// value and silently drop case names. Try the value verbatim first; if
+		// the schema rejects it AND the pin is enum-typed, fall back to the
+		// numeric byte value of the named case before returning a hard failure.
+		const FString PreviousDefault = Pin->DefaultValue;
 		if (Schema)
 			Schema->TrySetDefaultValue(*Pin, Value);
 		else
 			Pin->DefaultValue = Value;
+
+		const bool bSchemaAccepted = Pin->DefaultValue.Equals(Value)
+			|| !Pin->DefaultValue.Equals(PreviousDefault);
+
+		if (!bSchemaAccepted)
+		{
+			UEnum* PinEnum = Cast<UEnum>(Pin->PinType.PinSubCategoryObject.Get());
+			const bool bIsNumeric = !Value.IsEmpty() && Value.IsNumeric();
+			if (PinEnum && !bIsNumeric)
+			{
+				int32 EnumIndex = PinEnum->GetIndexByNameString(Value);
+				if (EnumIndex == INDEX_NONE)
+				{
+					const FString PrefixedName = FString::Printf(TEXT("%s::%s"), *PinEnum->GetName(), *Value);
+					EnumIndex = PinEnum->GetIndexByNameString(PrefixedName);
+				}
+				if (EnumIndex == INDEX_NONE)
+				{
+					UE_LOG(LogTemp, Error,
+						TEXT("SetNodePinValue: Value '%s' is not a valid case of enum '%s' for byte pin '%s' on node '%s'"),
+						*Value, *PinEnum->GetName(), *PinName, *NodeId);
+					return false;
+				}
+
+				const int64 NumericValue = PinEnum->GetValueByIndex(EnumIndex);
+				const FString NumericString = FString::Printf(TEXT("%lld"), NumericValue);
+				if (Schema)
+					Schema->TrySetDefaultValue(*Pin, NumericString);
+				else
+					Pin->DefaultValue = NumericString;
+
+				if (!Pin->DefaultValue.Equals(NumericString) && Pin->DefaultValue.Equals(PreviousDefault))
+				{
+					UE_LOG(LogTemp, Error,
+						TEXT("SetNodePinValue: Schema silently dropped enum case '%s' (numeric '%s') on byte pin '%s' on node '%s'"),
+						*Value, *NumericString, *PinName, *NodeId);
+					return false;
+				}
+
+				UE_LOG(LogTemp, Verbose,
+					TEXT("SetNodePinValue: Resolved enum case '%s' on enum '%s' to byte value '%s' for pin '%s'"),
+					*Value, *PinEnum->GetName(), *NumericString, *PinName);
+			}
+			else
+			{
+				UE_LOG(LogTemp, Error,
+					TEXT("SetNodePinValue: Schema silently dropped value '%s' on byte pin '%s' on node '%s' (stored value remains '%s')"),
+					*Value, *PinName, *NodeId, *Pin->DefaultValue);
+				return false;
+			}
+		}
+	}
+	else
+	{
+		// Primitive/string/enum/struct — use schema string path
+		const FString PreviousDefault = Pin->DefaultValue;
+		if (Schema)
+			Schema->TrySetDefaultValue(*Pin, Value);
+		else
+			Pin->DefaultValue = Value;
+
+		// Silent-drop guard (issue #373): if the schema rejected the value but
+		// the pin allows non-empty defaults, surface a hard failure rather than
+		// returning true with no mutation. We compare against both the requested
+		// value and the prior value so a schema-normalized value (e.g. trimmed
+		// whitespace, canonical numeric form) still counts as success.
+		if (!Pin->DefaultValue.Equals(Value) && Pin->DefaultValue.Equals(PreviousDefault) && !Value.IsEmpty())
+		{
+			UE_LOG(LogTemp, Error,
+				TEXT("SetNodePinValue: Schema silently dropped value '%s' on pin '%s' (category '%s'); stored value remains '%s'"),
+				*Value, *PinName, *PinCategory.ToString(), *Pin->DefaultValue);
+			return false;
+		}
 	}
 
 	FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);

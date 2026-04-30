@@ -198,6 +198,23 @@ int32 UEnumStructService::FindEnumValueIndex(UEnum* Enum, const FString& ValueNa
 		}
 	}
 
+	// Issue #373 ergonomic fix: UserDefinedEnum entries are stored with opaque
+	// internal names (NewEnumerator0..N). Callers (and the editor UI) typically
+	// know entries by their DisplayName instead. Fall back to a display-name
+	// lookup so rename_enum_value / set_enum_value_display_name /
+	// remove_enum_value can be invoked with the user-visible label.
+	if (const UUserDefinedEnum* UserEnum = Cast<const UUserDefinedEnum>(Enum))
+	{
+		for (int32 i = 0; i < UserEnum->NumEnums(); ++i)
+		{
+			const FString DisplayName = UserEnum->GetDisplayNameTextByIndex(i).ToString();
+			if (DisplayName.Equals(ValueName, ESearchCase::IgnoreCase))
+			{
+				return i;
+			}
+		}
+	}
+
 	return INDEX_NONE;
 }
 
@@ -559,14 +576,49 @@ bool UEnumStructService::RenameEnumValue(
 		return false;
 	}
 
-	// Set the new display name (this is how UE handles enum value "renaming")
-	FText NewDisplayText = FText::FromString(NewValueName);
-	FEnumEditorUtils::SetEnumeratorDisplayName(Enum, ValueIndex, NewDisplayText);
+	// BUG-3 fix (issue #373): UE does NOT permit renaming the internal short
+	// name of a UserDefinedEnum entry — the asset always stores them as
+	// "EnumName::NewEnumeratorN" and only the DisplayName text is mutable
+	// through the editor. Be explicit about this so callers don't expect
+	// `GetEnumeratorName()` (which returns the internal short name) to reflect
+	// the new value. Validate the proposed display name against UE's rules and
+	// surface a hard failure (rather than a silent success) if the editor
+	// rejects it.
+	const FText NewDisplayText = FText::FromString(NewValueName);
+	if (!FEnumEditorUtils::IsEnumeratorDisplayNameValid(Enum, ValueIndex, NewDisplayText))
+	{
+		UE_LOG(LogEnumStructService, Error,
+			TEXT("RenameEnumValue: Display name '%s' is not valid for enum '%s' (duplicates an existing entry or violates UE naming rules)"),
+			*NewValueName, *EnumPath);
+		return false;
+	}
+
+	const bool bDisplayNameApplied = FEnumEditorUtils::SetEnumeratorDisplayName(Enum, ValueIndex, NewDisplayText);
+	if (!bDisplayNameApplied)
+	{
+		UE_LOG(LogEnumStructService, Error,
+			TEXT("RenameEnumValue: SetEnumeratorDisplayName rejected '%s' for enum '%s' index %d"),
+			*NewValueName, *EnumPath, ValueIndex);
+		return false;
+	}
+
+	// Verify the change actually persisted in memory.
+	const FString StoredDisplayName = Enum->GetDisplayNameTextByIndex(ValueIndex).ToString();
+	if (!StoredDisplayName.Equals(NewValueName))
+	{
+		UE_LOG(LogEnumStructService, Error,
+			TEXT("RenameEnumValue: Display name silently dropped — requested '%s' but enum '%s' index %d still reports '%s'"),
+			*NewValueName, *EnumPath, ValueIndex, *StoredDisplayName);
+		return false;
+	}
 
 	Enum->MarkPackageDirty();
 
-	UE_LOG(LogEnumStructService, Log, TEXT("RenameEnumValue: Renamed value '%s' to '%s' in enum %s"),
-		*OldValueName, *NewValueName, *EnumPath);
+	UE_LOG(LogEnumStructService, Warning,
+		TEXT("RenameEnumValue: Updated DISPLAY name only for '%s' -> '%s' in enum %s. ")
+		TEXT("UE does not permit renaming UserDefinedEnum internal short names; ")
+		TEXT("GetEnumeratorName()/internal lookups will continue to return '%s'."),
+		*OldValueName, *NewValueName, *EnumPath, *OldValueName);
 	return true;
 }
 
@@ -596,9 +648,35 @@ bool UEnumStructService::SetEnumValueDisplayName(
 		return false;
 	}
 
-	// Set the display name
-	FText DisplayText = FText::FromString(DisplayName);
-	FEnumEditorUtils::SetEnumeratorDisplayName(Enum, ValueIndex, DisplayText);
+	// Set the display name. BUG-4 fix (issue #373): capture the bool returned
+	// by SetEnumeratorDisplayName and verify the value actually persisted, so
+	// we don't silently report success when UE rejects the new name.
+	const FText DisplayText = FText::FromString(DisplayName);
+	if (!FEnumEditorUtils::IsEnumeratorDisplayNameValid(Enum, ValueIndex, DisplayText))
+	{
+		UE_LOG(LogEnumStructService, Error,
+			TEXT("SetEnumValueDisplayName: Display name '%s' is not valid for enum '%s' (duplicates an existing entry or violates UE naming rules)"),
+			*DisplayName, *EnumPath);
+		return false;
+	}
+
+	const bool bDisplayNameApplied = FEnumEditorUtils::SetEnumeratorDisplayName(Enum, ValueIndex, DisplayText);
+	if (!bDisplayNameApplied)
+	{
+		UE_LOG(LogEnumStructService, Error,
+			TEXT("SetEnumValueDisplayName: SetEnumeratorDisplayName rejected '%s' for enum '%s' index %d"),
+			*DisplayName, *EnumPath, ValueIndex);
+		return false;
+	}
+
+	const FString StoredDisplayName = Enum->GetDisplayNameTextByIndex(ValueIndex).ToString();
+	if (!StoredDisplayName.Equals(DisplayName))
+	{
+		UE_LOG(LogEnumStructService, Error,
+			TEXT("SetEnumValueDisplayName: Display name silently dropped — requested '%s' but enum '%s' index %d still reports '%s'"),
+			*DisplayName, *EnumPath, ValueIndex, *StoredDisplayName);
+		return false;
+	}
 
 	Enum->MarkPackageDirty();
 
