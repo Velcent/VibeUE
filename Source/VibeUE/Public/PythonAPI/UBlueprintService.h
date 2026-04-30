@@ -1834,6 +1834,78 @@ public:
 	);
 
 	/**
+	 * Add a Comment box (UEdGraphNode_Comment) to a graph at an explicit position and size.
+	 * Comment boxes are the yellow/coloured bubbles that visually group nodes. By default
+	 * any K2 nodes whose bounds fall inside the comment box will be picked up and dragged
+	 * with the comment (GroupMovement mode), matching the standard editor behaviour when
+	 * the user creates a comment via the C hotkey.
+	 *
+	 * @param BlueprintPath - Full path to the blueprint
+	 * @param GraphName     - Name of the graph (e.g. "EventGraph", or a function name)
+	 * @param CommentText   - Text displayed in the comment header
+	 * @param PosX          - X position (top-left) in the graph
+	 * @param PosY          - Y position (top-left) in the graph
+	 * @param Width         - Width in graph units (default 400)
+	 * @param Height        - Height in graph units (default 200)
+	 * @param R, G, B, A    - Comment box colour (RGBA, 0-1). Default is the standard pale yellow.
+	 * @return Node ID (GUID) of the new comment node, empty string on failure.
+	 *
+	 * Example:
+	 *   cid = unreal.BlueprintService.add_comment_node(
+	 *       "/Game/BP_Player", "EventGraph", "Damage handling",
+	 *       100.0, 50.0, 600.0, 300.0, 1.0, 0.95, 0.4, 0.4)
+	 */
+	UFUNCTION(BlueprintCallable, Category = "VibeUE|Blueprints")
+	static FString AddCommentNode(
+		const FString& BlueprintPath,
+		const FString& GraphName,
+		const FString& CommentText,
+		float PosX = 0.0f,
+		float PosY = 0.0f,
+		float Width = 400.0f,
+		float Height = 200.0f,
+		float R = 1.0f,
+		float G = 0.95f,
+		float B = 0.4f,
+		float A = 0.4f
+	);
+
+	/**
+	 * Add a Comment box that wraps the supplied nodes. The position and size are computed
+	 * from the bounding box of the listed nodes, plus the requested padding. This is the
+	 * programmatic equivalent of selecting nodes in the editor and pressing C.
+	 *
+	 * Pair this with `get_selected_nodes()` to wrap whatever the user has highlighted in
+	 * the open Blueprint editor:
+	 *
+	 *   sel = unreal.BlueprintService.get_selected_nodes("/Game/BP_Player")
+	 *   ids = [n.node_id for n in sel]
+	 *   unreal.BlueprintService.add_comment_around_nodes(
+	 *       "/Game/BP_Player", "EventGraph", "Damage handling", ids)
+	 *
+	 * @param BlueprintPath - Full path to the blueprint
+	 * @param GraphName     - Name of the graph that contains the nodes
+	 * @param CommentText   - Text displayed in the comment header
+	 * @param NodeIds       - GUIDs of the nodes to wrap (as returned by get_selected_nodes / get_nodes_in_graph)
+	 * @param Padding       - Padding around the bounding box in graph units (default 40)
+	 * @param R, G, B, A    - Comment box colour (RGBA, 0-1). Default is the standard pale yellow.
+	 * @return Node ID (GUID) of the new comment node, empty string on failure (e.g. no
+	 *         valid node IDs found in the graph).
+	 */
+	UFUNCTION(BlueprintCallable, Category = "VibeUE|Blueprints")
+	static FString AddCommentAroundNodes(
+		const FString& BlueprintPath,
+		const FString& GraphName,
+		const FString& CommentText,
+		const TArray<FString>& NodeIds,
+		float Padding = 40.0f,
+		float R = 1.0f,
+		float G = 0.95f,
+		float B = 0.4f,
+		float A = 0.4f
+	);
+
+	/**
 	 * Connect two nodes by their pins.
 	 *
 	 * @param BlueprintPath - Full path to the blueprint
