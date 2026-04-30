@@ -143,6 +143,65 @@ namespace
 			}
 		}
 
+		// Blueprint asset path forms: "/Game/Path/BP_Foo", "/Game/Path/BP_Foo.BP_Foo",
+		// or "/Game/Path/BP_Foo.BP_Foo_C". FindObject/FindFirstObject only see classes
+		// already loaded into memory — for an unloaded Blueprint we have to actually
+		// load the asset to materialize its GeneratedClass.
+		if (ClassName.StartsWith(TEXT("/")))
+		{
+			FString PackagePath = ClassName;
+			int32 DotIdx;
+			if (PackagePath.FindChar(TEXT('.'), DotIdx))
+			{
+				PackagePath.LeftInline(DotIdx);
+			}
+			if (UObject* Loaded = UEditorAssetLibrary::LoadAsset(PackagePath))
+			{
+				if (UBlueprint* BP = Cast<UBlueprint>(Loaded))
+				{
+					if (BP->GeneratedClass)
+					{
+						return BP->GeneratedClass;
+					}
+				}
+				if (UClass* DirectClass = Cast<UClass>(Loaded))
+				{
+					return DirectClass;
+				}
+			}
+		}
+
+		// Asset registry lookup by short Blueprint name. Handles "BP_PatrolPointManager_C"
+		// and "BP_PatrolPointManager" when the Blueprint isn't loaded yet.
+		{
+			FString ShortName = ClassName;
+			if (ShortName.EndsWith(TEXT("_C"), ESearchCase::CaseSensitive))
+			{
+				ShortName.LeftChopInline(2);
+			}
+
+			if (!ShortName.IsEmpty() && !ShortName.Contains(TEXT("/")))
+			{
+				IAssetRegistry& Registry = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry")).Get();
+				TArray<FAssetData> Assets;
+				Registry.GetAssetsByClass(UBlueprint::StaticClass()->GetClassPathName(), Assets);
+				for (const FAssetData& Asset : Assets)
+				{
+					if (Asset.AssetName == FName(*ShortName))
+					{
+						if (UBlueprint* BP = Cast<UBlueprint>(Asset.GetAsset()))
+						{
+							if (BP->GeneratedClass)
+							{
+								return BP->GeneratedClass;
+							}
+						}
+						break;
+					}
+				}
+			}
+		}
+
 		return nullptr;
 	}
 
@@ -3989,6 +4048,155 @@ FString UBlueprintService::AddFunctionCallNode(
 	return CallNode->NodeGuid.ToString();
 }
 
+FString UBlueprintService::AddFunctionCallOnVariable(
+	const FString& BlueprintPath,
+	const FString& GraphName,
+	const FString& VariableName,
+	const FString& FunctionName,
+	float PosX,
+	float PosY)
+{
+	UBlueprint* Blueprint = LoadBlueprint(BlueprintPath);
+	if (!Blueprint)
+	{
+		UE_LOG(LogTemp, Error, TEXT("AddFunctionCallOnVariable: Failed to load blueprint: %s"), *BlueprintPath);
+		return FString();
+	}
+
+	UEdGraph* Graph = FindGraph(Blueprint, GraphName);
+	if (!Graph)
+	{
+		UE_LOG(LogTemp, Error, TEXT("AddFunctionCallOnVariable: Graph '%s' not found in %s"), *GraphName, *BlueprintPath);
+		return FString();
+	}
+
+	if (!Blueprint->GeneratedClass)
+	{
+		UE_LOG(LogTemp, Error, TEXT("AddFunctionCallOnVariable: Blueprint '%s' has no GeneratedClass — compile it first"), *BlueprintPath);
+		return FString();
+	}
+
+	// Resolve the variable's owner class via its property on the GeneratedClass.
+	// This handles inherited variables and avoids parsing FBPVariableDescription.VarType.
+	FProperty* VarProperty = Blueprint->GeneratedClass->FindPropertyByName(FName(*VariableName));
+	if (!VarProperty)
+	{
+		UE_LOG(LogTemp, Error, TEXT("AddFunctionCallOnVariable: Variable '%s' not found on %s"), *VariableName, *BlueprintPath);
+		return FString();
+	}
+
+	UClass* OwnerClass = nullptr;
+	if (FObjectProperty* ObjProp = CastField<FObjectProperty>(VarProperty))
+	{
+		OwnerClass = ObjProp->PropertyClass;
+	}
+	else if (FClassProperty* ClassProp = CastField<FClassProperty>(VarProperty))
+	{
+		OwnerClass = ClassProp->MetaClass;
+	}
+
+	if (!OwnerClass)
+	{
+		UE_LOG(LogTemp, Error, TEXT("AddFunctionCallOnVariable: Variable '%s' is not an object reference — cannot call a function on it"), *VariableName);
+		return FString();
+	}
+
+	// Find the function on the variable's class (or any parent).
+	UFunction* Function = OwnerClass->FindFunctionByName(FName(*FunctionName));
+	UEdGraphNode* SpawnedCallNode = nullptr;
+	if (!Function)
+	{
+		if (UBlueprintFunctionNodeSpawner* Spawner = FindBestFunctionSpawner(Blueprint, Graph, OwnerClass, FunctionName))
+		{
+			SpawnedCallNode = Spawner->Invoke(Graph, IBlueprintNodeBinder::FBindingSet(), FVector2D(PosX, PosY));
+			if (!SpawnedCallNode)
+			{
+				UE_LOG(LogTemp, Error, TEXT("AddFunctionCallOnVariable: Spawner fallback matched '%s' on '%s' but failed to invoke"), *FunctionName, *OwnerClass->GetName());
+				return FString();
+			}
+			if (const UFunction* Resolved = Spawner->GetFunction())
+			{
+				Function = const_cast<UFunction*>(Resolved);
+			}
+		}
+		else
+		{
+			UE_LOG(LogTemp, Error, TEXT("AddFunctionCallOnVariable: Function '%s' not found on '%s'"), *FunctionName, *OwnerClass->GetName());
+			return FString();
+		}
+	}
+
+	// Build the function call node (unless the spawner already produced one).
+	UK2Node_CallFunction* CallNode = Cast<UK2Node_CallFunction>(SpawnedCallNode);
+	if (!CallNode)
+	{
+		CallNode = NewObject<UK2Node_CallFunction>(Graph);
+		CallNode->SetFromFunction(Function);
+		Graph->AddNode(CallNode, false, false);
+		CallNode->CreateNewGuid();
+		CallNode->PostPlacedNewNode();
+		CallNode->AllocateDefaultPins();
+		CallNode->NodePosX = PosX;
+		CallNode->NodePosY = PosY;
+	}
+
+	// Build a self getter for the variable (offset to the left of the call node).
+	UK2Node_VariableGet* GetterNode = NewObject<UK2Node_VariableGet>(Graph);
+	GetterNode->VariableReference.SetSelfMember(FName(*VariableName));
+	Graph->AddNode(GetterNode, false, false);
+	GetterNode->CreateNewGuid();
+	GetterNode->PostPlacedNewNode();
+	GetterNode->AllocateDefaultPins();
+	GetterNode->NodePosX = PosX - 250.0f;
+	GetterNode->NodePosY = PosY + 16.0f;
+
+	// Wire variable output -> function call's self pin.
+	UEdGraphPin* VarOutPin = nullptr;
+	for (UEdGraphPin* Pin : GetterNode->Pins)
+	{
+		if (Pin && Pin->Direction == EGPD_Output)
+		{
+			VarOutPin = Pin;
+			break;
+		}
+	}
+
+	UEdGraphPin* SelfPin = CallNode->FindPin(UEdGraphSchema_K2::PN_Self, EGPD_Input);
+	if (!SelfPin)
+	{
+		// Some K2_* compact nodes use the function's first parameter as the self/target pin
+		// under a different display name. Fall back to the first input object pin.
+		for (UEdGraphPin* Pin : CallNode->Pins)
+		{
+			if (Pin && Pin->Direction == EGPD_Input && Pin->PinType.PinCategory == UEdGraphSchema_K2::PC_Object)
+			{
+				SelfPin = Pin;
+				break;
+			}
+		}
+	}
+
+	if (VarOutPin && SelfPin)
+	{
+		const UEdGraphSchema* Schema = Graph->GetSchema();
+		Schema->TryCreateConnection(VarOutPin, SelfPin);
+	}
+	else
+	{
+		UE_LOG(LogTemp, Warning, TEXT("AddFunctionCallOnVariable: Created nodes but could not auto-wire self pin for '%s::%s' (var pin: %s, self pin: %s)"),
+			*OwnerClass->GetName(), *FunctionName,
+			VarOutPin ? TEXT("ok") : TEXT("missing"),
+			SelfPin ? TEXT("ok") : TEXT("missing"));
+	}
+
+	FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
+	UE_LOG(LogTemp, Log, TEXT("AddFunctionCallOnVariable: %s.%s() in %s — call=%s, getter=%s"),
+		*VariableName, *FunctionName, *GraphName,
+		*CallNode->NodeGuid.ToString(), *GetterNode->NodeGuid.ToString());
+
+	return CallNode->NodeGuid.ToString();
+}
+
 FString UBlueprintService::AddComparisonNode(
 	const FString& BlueprintPath,
 	const FString& GraphName,
@@ -5460,13 +5668,108 @@ bool UBlueprintService::SetNodePinValue(
 			return false;
 		}
 	}
-	else
+	else if (PinCategory == UEdGraphSchema_K2::PC_Wildcard)
 	{
-		// Primitive/string/enum/struct — use schema string path
+		// BUG-2 fix (issue #373): wildcard pins (e.g. K2Node_Select case pins
+		// "NewEnumerator0..N" before the enum index resolves them) cannot store a
+		// literal default value. The schema silently drops the assignment, but
+		// SetNodePinValue used to claim success. Refuse with a diagnostic so
+		// callers know to either (a) configure the parent node so the pin
+		// resolves to a concrete type, or (b) wire a typed source like
+		// MakeLiteralName / MakeLiteralByte / MakeLiteralInt into the pin.
+		UE_LOG(LogTemp, Error,
+			TEXT("SetNodePinValue: Pin '%s' on node '%s' is a wildcard pin and cannot hold a literal default value. ")
+			TEXT("Resolve the wildcard first (e.g. configure the node's enum/type, or wire a MakeLiteral* source into the pin)."),
+			*PinName, *NodeId);
+		return false;
+	}
+	else if (PinCategory == UEdGraphSchema_K2::PC_Byte)
+	{
+		// BUG-1 fix (issue #373): some byte pins store the enum case name
+		// directly as a string (e.g. K2Node_EnumLiteral's "Enum" pin), while
+		// others — like the B pin of KismetMathLibrary::EqualEqual_ByteByte
+		// when typed against an enum-source — only accept the numeric byte
+		// value and silently drop case names. Try the value verbatim first; if
+		// the schema rejects it AND the pin is enum-typed, fall back to the
+		// numeric byte value of the named case before returning a hard failure.
+		const FString PreviousDefault = Pin->DefaultValue;
 		if (Schema)
 			Schema->TrySetDefaultValue(*Pin, Value);
 		else
 			Pin->DefaultValue = Value;
+
+		const bool bSchemaAccepted = Pin->DefaultValue.Equals(Value)
+			|| !Pin->DefaultValue.Equals(PreviousDefault);
+
+		if (!bSchemaAccepted)
+		{
+			UEnum* PinEnum = Cast<UEnum>(Pin->PinType.PinSubCategoryObject.Get());
+			const bool bIsNumeric = !Value.IsEmpty() && Value.IsNumeric();
+			if (PinEnum && !bIsNumeric)
+			{
+				int32 EnumIndex = PinEnum->GetIndexByNameString(Value);
+				if (EnumIndex == INDEX_NONE)
+				{
+					const FString PrefixedName = FString::Printf(TEXT("%s::%s"), *PinEnum->GetName(), *Value);
+					EnumIndex = PinEnum->GetIndexByNameString(PrefixedName);
+				}
+				if (EnumIndex == INDEX_NONE)
+				{
+					UE_LOG(LogTemp, Error,
+						TEXT("SetNodePinValue: Value '%s' is not a valid case of enum '%s' for byte pin '%s' on node '%s'"),
+						*Value, *PinEnum->GetName(), *PinName, *NodeId);
+					return false;
+				}
+
+				const int64 NumericValue = PinEnum->GetValueByIndex(EnumIndex);
+				const FString NumericString = FString::Printf(TEXT("%lld"), NumericValue);
+				if (Schema)
+					Schema->TrySetDefaultValue(*Pin, NumericString);
+				else
+					Pin->DefaultValue = NumericString;
+
+				if (!Pin->DefaultValue.Equals(NumericString) && Pin->DefaultValue.Equals(PreviousDefault))
+				{
+					UE_LOG(LogTemp, Error,
+						TEXT("SetNodePinValue: Schema silently dropped enum case '%s' (numeric '%s') on byte pin '%s' on node '%s'"),
+						*Value, *NumericString, *PinName, *NodeId);
+					return false;
+				}
+
+				UE_LOG(LogTemp, Verbose,
+					TEXT("SetNodePinValue: Resolved enum case '%s' on enum '%s' to byte value '%s' for pin '%s'"),
+					*Value, *PinEnum->GetName(), *NumericString, *PinName);
+			}
+			else
+			{
+				UE_LOG(LogTemp, Error,
+					TEXT("SetNodePinValue: Schema silently dropped value '%s' on byte pin '%s' on node '%s' (stored value remains '%s')"),
+					*Value, *PinName, *NodeId, *Pin->DefaultValue);
+				return false;
+			}
+		}
+	}
+	else
+	{
+		// Primitive/string/enum/struct — use schema string path
+		const FString PreviousDefault = Pin->DefaultValue;
+		if (Schema)
+			Schema->TrySetDefaultValue(*Pin, Value);
+		else
+			Pin->DefaultValue = Value;
+
+		// Silent-drop guard (issue #373): if the schema rejected the value but
+		// the pin allows non-empty defaults, surface a hard failure rather than
+		// returning true with no mutation. We compare against both the requested
+		// value and the prior value so a schema-normalized value (e.g. trimmed
+		// whitespace, canonical numeric form) still counts as success.
+		if (!Pin->DefaultValue.Equals(Value) && Pin->DefaultValue.Equals(PreviousDefault) && !Value.IsEmpty())
+		{
+			UE_LOG(LogTemp, Error,
+				TEXT("SetNodePinValue: Schema silently dropped value '%s' on pin '%s' (category '%s'); stored value remains '%s'"),
+				*Value, *PinName, *PinCategory.ToString(), *Pin->DefaultValue);
+			return false;
+		}
 	}
 
 	FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
